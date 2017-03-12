@@ -11,3 +11,5 @@ Config saved and restored to / from flash.
 
 Basic network conections and server authorisation passwords are set in the code and must be separately set up.
 
+Needs OneWire, DallasTemperature and PubSubClient libraries to be added
+
