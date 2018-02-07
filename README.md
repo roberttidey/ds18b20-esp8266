@@ -6,10 +6,11 @@ Configurable to report to EasyIOT and / or Home Assistant servers
 Configurable update interval time and force updates even temperature unchanged
 Configuration fetched from a web server file keyed on Mac Address of esp-8266 to allow for multiple units
 Web update of software
-Resileint allowing retries on network and server connections
+Resilient allowing retries on network and server connections
 Config saved and restored to / from flash.
+Web Manager for initial wifi set up via AP mode
 
-Basic network conections and server authorisation passwords are set in the code and must be separately set up.
+On first use Wifi Manager will start an access point. Connect to this from a wifi client then browse to 192.168.4.1 to set up wifi
 
 Needs OneWire, DallasTemperature and PubSubClient libraries to be added
 
