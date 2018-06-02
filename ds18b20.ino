@@ -15,16 +15,18 @@
  */
 
 #include <ESP8266WiFi.h>
-#include <WiFiClient.h>
+#include <ESP8266HTTPClient.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
 #include <ESP8266HTTPUpdateServer.h>
-#include <PubSubClient.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include "Base64.h"
+#include <Base64.h>
 #include <DNSServer.h>
 #include <WiFiManager.h>
+
+//put -1 s at end
+int unusedPins[11] = {0,2,4,5,12,14,15,16,-1,-1,-1};
 
 /*
 Wifi Manager Web set up
@@ -35,6 +37,8 @@ If WM_NAME defined then use WebManager
 #ifdef WM_NAME
 	WiFiManager wifiManager;
 #endif
+char wmName[33];
+
 //uncomment to use a static IP
 //#define WM_STATIC_IP 192,168,0,100
 //#define WM_STATIC_GATEWAY 192,168,0,1
@@ -54,13 +58,12 @@ const char* update_password = "password";
 
 //bit mask for server support
 #define EASY_IOT_MASK 1
-#define MQTT_MASK 2
 #define BOILER_MASK 4
 #define BELL_MASK 8
 #define SECURITY_MASK 16
 #define LIGHTCONTROL_MASK 32
 #define RESET_MASK 64
-int serverMode = 1;
+int serverMode = 0;
 
 #define ONE_WIRE_BUS 13  // DS18B20 pin
 OneWire oneWire(ONE_WIRE_BUS);
@@ -82,33 +85,21 @@ String macAddr;
 
 ESP8266WebServer server(AP_PORT);
 ESP8266HTTPUpdateServer httpUpdater;
-WiFiClient cClient;
+HTTPClient cClient;
 
-//Config remote fetch from web page
-#define CONFIG_IP_ADDRESS  "192.168.0.7"
-#define CONFIG_PORT        80
+//Config remote fetch from web page (include port in url if not 80)
+#define CONFIG_IP_ADDRESS  "http://192.168.0.250/espConfig"
 //Comment out for no authorisation else uses same authorisation as EIOT server
 #define CONFIG_AUTH 1
-#define CONFIG_PAGE "espConfig"
 #define CONFIG_RETRIES 10
 
 // EasyIoT server definitions
 #define EIOT_USERNAME    "admin"
 #define EIOT_PASSWORD    "password"
-#define EIOT_IP_ADDRESS  "192.168.0.7"
-#define EIOT_PORT        80
-#define USER_PWD_LEN 40
-char unameenc[USER_PWD_LEN];
+//EIOT report URL (include port in url if not 80)
+#define EIOT_IP_ADDRESS  "http://192.168.0.250/Api/EasyIoT/Control/Module/Virtual/"
 String eiotNode = "-1";
 
-//Home assistant access
-#define mqtt_server "192.168.0.100"
-#define mqtt_user "homeassistant"
-#define mqtt_password "password"
-#define MQTT_RETRIES 5
-String temperature_topic = "sensor/studyT";
-WiFiClient mClient;
-PubSubClient mqttClient(mClient);
 
 //general variables
 float oldTemp, newTemp;
@@ -138,28 +129,38 @@ void ICACHE_RAM_ATTR  delayuSec(unsigned long uSec) {
 	yield();
 }
 
+void unusedIO() {
+	int i;
+	
+	for(i=0;i<11;i++) {
+		if(unusedPins[i] < 0) {
+			break;
+		} else if(unusedPins[i] != 16) {
+			pinMode(unusedPins[i],INPUT_PULLUP);
+		} else {
+			pinMode(16,INPUT_PULLDOWN_16);
+		}
+	}
+}
+
 /*
   Set up basic wifi, collect config from flash/server, initiate update server
 */
 void setup() {
+	unusedIO();
 	Serial.begin(115200);
-	char uname[USER_PWD_LEN];
-	String str = String(EIOT_USERNAME)+":"+String(EIOT_PASSWORD);  
-	str.toCharArray(uname, USER_PWD_LEN); 
-	memset(unameenc,0,sizeof(unameenc));
-	base64_encode(unameenc, uname, strlen(uname));
 	Serial.println("Set up Web update service");
-	wifiConnect(0);
 	macAddr = WiFi.macAddress();
 	macAddr.replace(":","");
 	Serial.println(macAddr);
+	wifiConnect(0);
 	getConfig();
-	mqttClient.setServer(mqtt_server, 1883);
 
 	//Update service
 	MDNS.begin(host.c_str());
 	httpUpdater.setup(&server, update_path, update_username, update_password);
 	server.on("/reloadConfig", reloadConfig);
+	server.on("/heap", getHeap);
 	server.begin();
 
 	MDNS.addService("http", "tcp", 80);
@@ -176,10 +177,10 @@ int wifiConnect(int check) {
 			if(WiFi.status() != WL_CONNECTED) {
 				Serial.println("Wifi connection timed out. Try to relink");
 			} else {
+				wifiCheckTime = elapsedTime;
 				return 1;
 			}
 		} else {
-			wifiCheckTime = elapsedTime;
 			return 0;
 		}
 	}
@@ -189,13 +190,12 @@ int wifiConnect(int check) {
 #ifdef WM_STATIC_IP
 	wifiManager.setSTAStaticIPConfig(IPAddress(WM_STATIC_IP), IPAddress(WM_STATIC_GATEWAY), IPAddress(255,255,255,0));
 #endif
-	if(check == 0) {
-		wifiManager.setConfigPortalTimeout(180);
-		//Revert to STA if wifimanager times out as otherwise APA is left on.
-		if(!wifiManager.autoConnect(WM_NAME, WM_PASSWORD)) WiFi.mode(WIFI_STA);
-	} else {
-		WiFi.begin();
-	}
+	wifiManager.setConfigPortalTimeout(180);
+	//Revert to STA if wifimanager times out as otherwise APA is left on.
+	strcpy(wmName, WM_NAME);
+	strcat(wmName, macAddr.c_str());
+	wifiManager.autoConnect(wmName, WM_PASSWORD);
+	WiFi.mode(WIFI_STA);
 #else
 	Serial.println("Set up manual Web");
 	int retries = 0;
@@ -231,68 +231,73 @@ int wifiConnect(int check) {
 */
 void getConfig() {
 	int responseOK = 0;
+	int httpCode;
+	int len;
 	int retries = CONFIG_RETRIES;
+	String url = String(CONFIG_IP_ADDRESS);
+	Serial.println("Config url - " + url);
 	String line = "";
 
 	while(retries > 0) {
-		clientConnect(CONFIG_IP_ADDRESS, CONFIG_PORT);
 		Serial.print("Try to GET config data from Server for: ");
 		Serial.println(macAddr);
-
-		cClient.print(String("GET /") + CONFIG_PAGE + " HTTP/1.1\r\n" +
-			"Host: " + String(CONFIG_IP_ADDRESS) + "\r\n" + 
 		#ifdef CONFIG_AUTH
-				"Authorization: Basic " + unameenc + " \r\n" + 
+			cClient.setAuthorization(EIOT_USERNAME, EIOT_PASSWORD);
+		#else
+			cClient.setAuthorization("");		
 		#endif
-			"Content-Length: 0\r\n" + 
-			"Connection: close\r\n" + 
-			"\r\n");
-		int config = 100;
-		int timeout = 0;
-		while (cClient.connected() && timeout < 10){
-			if (cClient.available()) {
-				timeout = 0;
-				line = cClient.readStringUntil('\n');
-				if(line.indexOf("HTTP") == 0 && line.indexOf("200 OK") > 0)
-					responseOK = 1;
-				//Don't bother processing when config complete
-				if (config >= 0) {
-					line.replace("\r","");
-					Serial.println(line);
-					//start reading config when mac address found
-					if (line == macAddr) {
-						config = 0;
-					} else {
-						if(line.charAt(0) != '#') {
-							switch(config) {
-								case 0: host = line;break;
-								case 1: serverMode = line.toInt();break;
-								case 2: eiotNode = line;break;
-								case 3: break; //spare
-								case 4: minMsgInterval = line.toInt();break;
-								case 5:
-									forceInterval = line.toInt();
-									Serial.println("Config fetched from server OK");
-									config = -100;
-									break;
+		cClient.begin(url);
+		httpCode = cClient.GET();
+		if (httpCode > 0) {
+			if (httpCode == HTTP_CODE_OK) {
+				responseOK = 1;
+				int config = 100;
+				len = cClient.getSize();
+				if (len < 0) len = -10000;
+				Serial.println("Response Size:" + String(len));
+				WiFiClient * stream = cClient.getStreamPtr();
+				while (cClient.connected() && (len > 0 || len <= -10000)) {
+					if(stream->available()) {
+						line = stream->readStringUntil('\n');
+						len -= (line.length() +1 );
+						//Don't bother processing when config complete
+						if (config >= 0) {
+							line.replace("\r","");
+							Serial.println(line);
+							//start reading config when mac address found
+							if (line == macAddr) {
+								config = 0;
+							} else {
+								if(line.charAt(0) != '#') {
+									switch(config) {
+										case 0: host = line;break;
+										case 1: serverMode = line.toInt();break;
+										case 2: eiotNode = line;break;
+										case 3: break; //spare
+										case 4: minMsgInterval = line.toInt();break;
+										case 5:
+											forceInterval = line.toInt();
+											Serial.println("Config fetched from server OK");
+											config = -100;
+									}
+									config++;
+								}
 							}
-							config++;
 						}
 					}
 				}
-			} else {
-				delaymSec(1000);
-				timeout++;
-				Serial.println("Wait for response");
 			}
+		} else {
+			Serial.printf("[HTTP] POST... failed, error: %s\n", cClient.errorToString(httpCode).c_str());
 		}
-		cClient.stop();
-		if(responseOK == 1)
+		cClient.end();
+		if(responseOK)
 			break;
+		Serial.println("Retrying get config");
 		retries--;
 	}
 	Serial.println();
-	Serial.println("Connection closed");
+	Serial.println("Connection closed. Length left:" + String(len));
 	Serial.print("host:");Serial.println(host);
 	Serial.print("serverMode:");Serial.println(serverMode);
 	Serial.print("eiotNode:");Serial.println(eiotNode);
@@ -313,51 +318,15 @@ void reloadConfig() {
 	}
 }
 
-
-
 /*
-  Establish client connection
+  get heap
 */
-void clientConnect(char* host, uint16_t port) {
-	int retries = 0;
-   
-	while(!cClient.connect(host, port)) {
-		Serial.print("?");
-		retries++;
-		if(retries > CONFIG_RETRIES) {
-			Serial.print("Client connection failed:" );
-			Serial.println(host);
-			wifiConnect(0); 
-			retries = 0;
-		} else {
-			delaymSec(5000);
-		}
-	}
-}
-
-/*
-  Establish MQTT connection for publishing to Home assistant
-*/
-void mqttConnect() {
-	// Loop until we're reconnected
-	int retries = 0;
-	while (!mqttClient.connected()) {
-		Serial.print("Attempting MQTT connection...");
-		// Attempt to connect
-		// If you do not want to use a username and password, change next line to
-		// if (mqttClient.connect("ESP8266mqttClient")) {
-		if (mqttClient.connect("ESP8266Client", mqtt_user, mqtt_password)) {
-			Serial.println("connected");
-		} else {
-			Serial.print("failed, rc=");
-			Serial.print(mqttClient.state());
-			delay(5000);
-			retries++;
-			if(retries > MQTT_RETRIES) {
-				wifiConnect(1);
-				retries = 0;
-			}
-		}
+void getHeap() {
+	if (server.arg("auth") != AP_AUTHID) {
+		Serial.println("Unauthorized");
+		server.send(401, "text/html", "Unauthorized");
+	} else {
+		server.send(200, "text/html", "Heap " + String(ESP.getFreeHeap()));
 	}
 }
 
@@ -369,20 +338,6 @@ bool checkBound(float newValue, float prevValue, float maxDiff) {
          (newValue < prevValue - maxDiff || newValue > prevValue + maxDiff);
 }
 
-/*
- Send report by MQTT
-*/
-void mqttReport(String topic, float value) {
-	int retries = CONFIG_RETRIES;
-	if (!mqttClient.connected() && retries > 0) {
-		mqttConnect();
-		retries--;
-	}
-	if(mqttClient.connected()) {
-		mqttClient.loop();
-		mqttClient.publish(topic.c_str(), String(value).c_str(), true);
-	}
-}
 
 /*
  Send report to easyIOTReport
@@ -391,37 +346,33 @@ void mqttReport(String topic, float value) {
 void easyIOTReport(String node, float value, int digital) {
 	int retries = CONFIG_RETRIES;
 	int responseOK = 0;
-	String url = "/Api/EasyIoT/Control/Module/Virtual/" + node;
-	
+	int httpCode;
+	String url = String(EIOT_IP_ADDRESS) + node;
 	// generate EasIoT server node URL
 	if(digital == 1) {
 		if(value > 0)
 			url += "/ControlOn";
 		else
 			url += "/ControlOff";
-	} else
+	} else {
 		url += "/ControlLevel/" + String(value);
-
+	}
 	Serial.print("POST data to URL: ");
 	Serial.println(url);
 	while(retries > 0) {
-		clientConnect(EIOT_IP_ADDRESS, EIOT_PORT);
-		cClient.print(String("POST ") + url + " HTTP/1.1\r\n" +
-				"Host: " + String(EIOT_IP_ADDRESS) + "\r\n" + 
-				"Connection: close\r\n" + 
-				"Authorization: Basic " + unameenc + " \r\n" + 
-				"Content-Length: 0\r\n" + 
-				"\r\n");
-
-		delaymSec(100);
-		while(cClient.available()){
-			String line = cClient.readStringUntil('\r');
-			if(line)
-			Serial.print(line);
-			if(line.indexOf("HTTP") == 0 && line.indexOf("200 OK") > 0)
+		cClient.setAuthorization(EIOT_USERNAME, EIOT_PASSWORD);
+		cClient.begin(url);
+		httpCode = cClient.GET();
+		if (httpCode > 0) {
+			if (httpCode == HTTP_CODE_OK) {
+				String payload = cClient.getString();
+				Serial.println(payload);
 				responseOK = 1;
+			}
+		} else {
+			Serial.printf("[HTTP] POST... failed, error: %s\n", cClient.errorToString(httpCode).c_str());
 		}
-		cClient.stop();
+		cClient.end();
 		if(responseOK)
 			break;
 		else
@@ -436,7 +387,7 @@ void easyIOTReport(String node, float value, int digital) {
  Check temperature and report if necessary
 */
 void checkTemp() {
-	if((serverMode & (EASY_IOT_MASK | MQTT_MASK)) && (elapsedTime - tempCheckTime) * timeInterval / 1000 > minMsgInterval) {
+	if((serverMode & EASY_IOT_MASK) && (elapsedTime - tempCheckTime) * timeInterval / 1000 > minMsgInterval) {
 		DS18B20.requestTemperatures(); 
 		newTemp = DS18B20.getTempCByIndex(0);
 		if(newTemp != 85.0 && newTemp != (-127.0)) {
@@ -446,8 +397,7 @@ void checkTemp() {
 				oldTemp = newTemp;
 				Serial.print("New temperature:");
 				Serial.println(String(newTemp).c_str());
-				if(serverMode & EASY_IOT_MASK) easyIOTReport(eiotNode, newTemp, 0);
-				if(serverMode & MQTT_MASK) mqttReport(temperature_topic, newTemp);
+				easyIOTReport(eiotNode, newTemp, 0);
 			}
 		} else {
 			Serial.println("Invalid temp reading");

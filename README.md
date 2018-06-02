@@ -2,7 +2,7 @@
 Temperature sensor module for esp8266 reporting to EasyIOT and Home Assistant
 
 Features
-Configurable to report to EasyIOT and / or Home Assistant servers
+Report to EasyIOT Home Assistant servers
 Configurable update interval time and force updates even temperature unchanged
 Configuration fetched from a web server file keyed on Mac Address of esp-8266 to allow for multiple units
 Web update of software
@@ -12,5 +12,5 @@ Web Manager for initial wifi set up via AP mode
 
 On first use Wifi Manager will start an access point. Connect to this from a wifi client then browse to 192.168.4.1 to set up wifi
 
-Needs OneWire, DallasTemperature and PubSubClient libraries to be added
+Needs OneWire, DallasTemperature libraries to be added
 
